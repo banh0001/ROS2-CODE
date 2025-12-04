@@ -2,6 +2,10 @@
 #include <Arduino.h>
 #include <micro_ros_platformio.h>
 #include <stdio.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
 #include <nav_msgs/msg/odometry.h>
 #include <sensor_msgs/msg/imu.h>
 #include <sensor_msgs/msg/magnetic_field.h>
@@ -10,16 +14,77 @@
 #include <geometry_msgs/msg/twist.h>
 #include <geometry_msgs/msg/vector3.h>
 #include "config.h"
+#include "syslog.h"
 #include "motor.h"
+#include "kinematics.h"
 #include "pid.h"
+#include "odometry.h"
+#include "imu.h"
+#include "mag.h"
 #define ENCODER_USE_INTERRUPTS
 #define ENCODER_OPTIMIZE_INTERRUPTS
 #include "encoder.h"
-#include "kinematics.h"
+#include "battery.h"
+#include "range.h"
+#include "lidar.h"
+#ifdef WDT_TIMEOUT
+#include <esp_task_wdt.h>
+#endif
 #ifndef BAUDRATE
 #define BAUDRATE 115200
 #endif
-#define SAMPLE_TIME 20 // seconds
+#ifndef NODE_NAME
+#define NODE_NAME "linorobot_base_node"
+#endif
+#ifndef TOPIC_PREFIX
+#define TOPIC_PREFIX
+#endif
+
+#ifndef RCCHECK
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){rclErrorLoop();}}
+#endif
+#ifndef RCSOFTCHECK
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){}}
+#endif
+#define EXECUTE_EVERY_N_MS(MS, X)  do { \
+  static volatile int64_t init = -1; \
+  if (init == -1) { init = uxr_millis();} \
+  if (uxr_millis() - init > MS) { X; init = uxr_millis();} \
+} while (0)
+
+rcl_publisher_t odom_publisher;
+rcl_publisher_t imu_publisher;
+rcl_publisher_t mag_publisher;
+rcl_subscription_t twist_subscriber;
+rcl_publisher_t battery_publisher;
+rcl_publisher_t range_publisher;
+
+nav_msgs__msg__Odometry odom_msg;
+sensor_msgs__msg__Imu imu_msg;
+sensor_msgs__msg__MagneticField mag_msg;
+geometry_msgs__msg__Twist twist_msg;
+sensor_msgs__msg__BatteryState battery_msg;
+sensor_msgs__msg__Range range_msg;
+
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+rcl_timer_t control_timer;
+rcl_timer_t battery_timer;
+rcl_timer_t range_timer;
+
+unsigned long long time_offset = 0;
+unsigned long prev_cmd_time = 0;
+unsigned long prev_odom_update = 0;
+
+enum states 
+{
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+} state;
 
 Encoder motor1_encoder(MOTOR1_ENCODER_A, MOTOR1_ENCODER_B, COUNTS_PER_REV1, MOTOR1_ENCODER_INV);
 Encoder motor2_encoder(MOTOR2_ENCODER_A, MOTOR2_ENCODER_B, COUNTS_PER_REV2, MOTOR2_ENCODER_INV);
@@ -37,308 +102,419 @@ PID motor3_pid(PWM_MIN, PWM_MAX, K_P3, K_I3, K_D3);
 PID motor4_pid(PWM_MIN, PWM_MAX, K_P4, K_I4, K_D4);
 
 Kinematics kinematics(
-    Kinematics::LINO_BASE,
-    MOTOR_MAX_RPM,
-    MAX_RPM_RATIO,
-    MOTOR_OPERATING_VOLTAGE,
-    MOTOR_POWER_MAX_VOLTAGE,
-    WHEEL_DIAMETER,
-    LR_WHEELS_DISTANCE);
+    Kinematics::LINO_BASE, 
+    MOTOR_MAX_RPM, 
+    MAX_RPM_RATIO, 
+    MOTOR_OPERATING_VOLTAGE, 
+    MOTOR_POWER_MAX_VOLTAGE, 
+    WHEEL_DIAMETER, 
+    LR_WHEELS_DISTANCE
+);
 
-long long int counts_per_rev[4];
-int total_motors = 4;
-Motor *motors[4] = {&motor1_controller, &motor2_controller, &motor3_controller, &motor4_controller};
-Encoder *encoders[4] = {&motor1_encoder, &motor2_encoder, &motor3_encoder, &motor4_encoder};
-PID *pids[4] = {&motor1_pid, &motor2_pid, &motor3_pid, &motor4_pid};
-String labels[4] = {"FRONT LEFT - M1: ", "FRONT RIGHT - M2: ", "REAR LEFT - M3: ", "REAR RIGHT - M4: "};
+Odometry odometry;
+IMU imu;
+MAG mag;
 
-void setup()
+void setup() 
 {
-#ifdef BOARD_INIT
+#ifdef BOARD_INIT // board specific setup
     BOARD_INIT;
 #endif
 
     Serial.begin(BAUDRATE);
-    while (!Serial)
+    pinMode(LED_PIN, OUTPUT);
+#ifdef SDA_PIN // specify I2C pins
+#ifdef ESP32
+    Wire.begin(SDA_PIN, SCL_PIN);
+#else // teensy
+    Wire.setSDA(SDA_PIN);
+    Wire.setSCL(SCL_PIN);
+#endif
+#endif
+#ifdef WDT_TIMEOUT
+    esp_task_wdt_init(WDT_TIMEOUT, true); //enable panic so ESP32 restarts
+    esp_task_wdt_add(NULL); //add current thread to WDT watch
+#endif
+    
+    bool imu_ok = imu.init();
+    if(!imu_ok)
     {
-    }
-    Serial.println("Sampling process will spin the motors at its maximum RPM.");
-    Serial.println("Please ensure that the robot is ELEVATED and there are NO OBSTRUCTIONS to the wheels.");
-    Serial.println("");
-    Serial.println("Type 'spin' and press enter to spin the motors.");
-    Serial.println("Type 'sample' and press enter to spin the motors with motor summary.");
-    Serial.println("Type 'ticks' and press enter to measure ticks per revolution of the motors.");
-    Serial.println("Type 'test' and press enter to spin the using cmd_vel and observe PID in action.");
-    Serial.println("Press enter to clear command.");
-    Serial.println("");
-}
-
-void loop()
-{
-    static String cmd = "";
-
-    while (Serial.available())
-    {
-        char character = Serial.read();
-        cmd.concat(character);
-        Serial.print(character);
-        delay(1);
-        if (character == '\r' and cmd.equals("spin\r"))
+        while(1)
         {
-            cmd = "";
-            Serial.println("\r\n");
-            sampleMotors(0);
-        }
-        else if (character == '\r' and cmd.equals("sample\r"))
-        {
-            cmd = "";
-            Serial.println("\r\n");
-            sampleMotors(1);
-        }
-        else if (character == '\r' and cmd.equals("ticks\r"))
-        {
-            cmd = "";
-            Serial.println("\r\n");
-            testMotorForTicksPerRevolution();
-        }
-        else if (character == '\r' and cmd.equals("test\r"))
-        {
-            cmd = "";
-            Serial.println("\r\n");
-            testMotorsWithCmdVel();
-        }
-        else if (character == '\r')
-        {
-            Serial.println("");
-            cmd = "";
+            flashLED(3);
         }
     }
-}
-void testMotorForTicksPerRevolution()
-{
-    if (Kinematics::LINO_BASE == Kinematics::DIFFERENTIAL_DRIVE)
-    {
-        total_motors = 2;
-    }
-    int PWM_FOR_TEST = 200;
-    unsigned long start_time = micros();
-    unsigned long last_status = micros();
-    bool show_incremental_tick_count = false;
+    mag.init();
+    initBattery();
+    initRange();
     
 
-    Serial.println("Please ensure that the robot is ELEVATED and there are NO OBSTRUCTIONS to the wheels.");
-    Serial.println("ticks test will run each motor at slow speed one motor at a time.");
-    Serial.println("count the number of revolutions visually and make a note of final tick count for each motor along with number of revolutions observed.");
-    Serial.println("Number of ticks for each motor can be calculated with following formula:");
-    Serial.println("ticks per rev = final tick count/number of revolutions counted");
-    Serial.println("Press enter to continue to tick count test.");
-    Serial.println("");
-    char character = Serial.read();
 
-    for (int i = 0; i < total_motors; i++)
-    {
-        Serial.print(labels[i]);
-        while (true)
-        {
-            if (micros() - start_time >= SAMPLE_TIME * 1000000)
-                {
-                    //Serial.println("STOP motor");
-                    motors[i]->brake();
-                    start_time = micros();
+    set_microros_serial_transports(Serial);
 
-                    break;
-                }
-
-
-            // the required rpm is capped at -/+ MAX_RPM to prevent the PID from having too much error
-            // the PWM value sent to the motor driver is the calculated PID based on required RPM vs measured RPM
-            float current_tick_count = encoders[i]->read();
-            // set show_incremental_tick_count = true at beginning of function if you want to print incremental values
-            // otherwise it will only print final total tick count for each motor
-            if(show_incremental_tick_count){
-                Serial.print("current_tick_count:: ");
-                Serial.println(current_tick_count);
-            }else{
-                Serial.print(".");
-
-            }
-            // run the motor with low pwm so it rotates slowly and revolutions can be counted visually
-            // If the motor is rotating too fast change value of PWM_FOR_TEST at beginning of this function
-            int pwm = PWM_FOR_TEST; 
-            motors[i]->spin(pwm);
-            delay(1000);
-
-        }
-        Serial.println("");
-        Serial.print("final_tick_count for ");
-        Serial.print(labels[i]);
-        Serial.print(" = ");
-        float final_tick_count = encoders[i]->read();
-        Serial.println(final_tick_count);
-        Serial.println("=============");
-
-    }
-
+    syslog(LOG_INFO, "%s Ready %lu", __FUNCTION__, millis());
 }
-void testMotorsWithCmdVel()
-{
-    if (Kinematics::LINO_BASE == Kinematics::DIFFERENTIAL_DRIVE)
+
+void loop() {
+    switch (state) 
     {
-        total_motors = 2;
+        case WAITING_AGENT:
+            EXECUTE_EVERY_N_MS(500, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;);
+            break;
+        case AGENT_AVAILABLE:
+            syslog(LOG_INFO, "%s agent available %lu", __FUNCTION__, millis());
+            state = (true == createEntities()) ? AGENT_CONNECTED : WAITING_AGENT;
+            if (state == WAITING_AGENT) 
+            {
+                destroyEntities();
+            }
+            break;
+        case AGENT_CONNECTED:
+            EXECUTE_EVERY_N_MS(200, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+            if (state == AGENT_CONNECTED) 
+            {
+                rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+            }
+            break;
+        case AGENT_DISCONNECTED:
+            syslog(LOG_INFO, "%s agent disconnected %lu", __FUNCTION__, millis());
+            fullStop();
+            destroyEntities();
+            state = WAITING_AGENT;
+            break;
+        default:
+            break;
     }
-    geometry_msgs__msg__Twist twist_msg;
-    // set test twist message with x=0.5 fwd full speed
-    twist_msg.linear.x = 0.5;
+    
+#ifdef WDT_TIMEOUT
+    esp_task_wdt_reset();
+#endif
+}
+
+void controlCallback(rcl_timer_t * timer, int64_t last_call_time) 
+{
+    RCLC_UNUSED(last_call_time);
+    if (timer != NULL) 
+    {
+       moveBase();
+       publishData();
+    }
+}
+
+void batteryCallback(rcl_timer_t * timer, int64_t last_call_time)
+{
+    RCLC_UNUSED(last_call_time);
+    if (timer != NULL)
+    {
+        battery_msg = getBattery();
+	struct timespec time_stamp = getTime();
+	battery_msg.header.stamp.sec = time_stamp.tv_sec;
+	battery_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+	RCSOFTCHECK(rcl_publish(&battery_publisher, &battery_msg, NULL));
+    }
+}
+
+void rangeCallback(rcl_timer_t * timer, int64_t last_call_time)
+{
+    RCLC_UNUSED(last_call_time);
+    if (timer != NULL)
+    {
+        range_msg = getRange();
+	struct timespec time_stamp = getTime();
+	range_msg.header.stamp.sec = time_stamp.tv_sec;
+	range_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+	RCSOFTCHECK(rcl_publish(&range_publisher, &range_msg, NULL));
+    }
+}
+
+void twistCallback(const void * msgin) 
+{
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+
+    prev_cmd_time = millis();
+}
+
+bool createEntities()
+{
+    syslog(LOG_INFO, "%s %lu", __FUNCTION__, millis());
+    allocator = rcl_get_default_allocator();
+    //create init_options
+    RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+    // create node
+    RCCHECK(rclc_node_init_default(&node, NODE_NAME, "", &support));
+    // create odometry publisher
+    RCCHECK(rclc_publisher_init_default( 
+        &odom_publisher, 
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+        TOPIC_PREFIX "odom/unfiltered"
+    ));
+    // create IMU publisher
+    RCCHECK(rclc_publisher_init_default( 
+        &imu_publisher, 
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
+        TOPIC_PREFIX "imu/data"
+    ));
+    RCCHECK(rclc_publisher_init_default(
+        &mag_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, MagneticField),
+        TOPIC_PREFIX "imu/mag"
+    ));
+    // create battery pyblisher
+    RCCHECK(rclc_publisher_init_default(
+	&battery_publisher,
+	&node,
+	ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, BatteryState),
+	TOPIC_PREFIX "battery"
+    ));
+    // create range pyblisher
+    RCCHECK(rclc_publisher_init_default(
+	&range_publisher,
+	&node,
+	ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Range),
+	TOPIC_PREFIX "ultrasound"
+    ));
+    // create twist command subscriber
+    RCCHECK(rclc_subscription_init_default( 
+        &twist_subscriber, 
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+        TOPIC_PREFIX "cmd_vel"
+    ));
+    // create timer for actuating the motors at 50 Hz (1000/20)
+    const unsigned int control_timeout = 20;
+    RCCHECK(rclc_timer_init_default( 
+        &control_timer, 
+        &support,
+        RCL_MS_TO_NS(control_timeout),
+        controlCallback
+    ));
+    const unsigned int battery_timer_timeout = 2000;
+    RCCHECK(rclc_timer_init_default(
+        &battery_timer,
+        &support,
+        RCL_MS_TO_NS(battery_timer_timeout),
+        batteryCallback
+    ));
+    const unsigned int range_timer_timeout = 100;
+    RCCHECK(rclc_timer_init_default(
+        &range_timer,
+        &support,
+        RCL_MS_TO_NS(range_timer_timeout),
+        rangeCallback
+    ));
+    executor = rclc_executor_get_zero_initialized_executor();
+    RCCHECK(rclc_executor_init(&executor, &support.context, 4, & allocator));
+    RCCHECK(rclc_executor_add_subscription(
+        &executor, 
+        &twist_subscriber, 
+        &twist_msg, 
+        &twistCallback, 
+        ON_NEW_DATA
+    ));
+    RCCHECK(rclc_executor_add_timer(&executor, &control_timer));
+    RCCHECK(rclc_executor_add_timer(&executor, &battery_timer));
+    RCCHECK(rclc_executor_add_timer(&executor, &range_timer));
+
+    // synchronize time with the agent
+    syncTime();
+    digitalWrite(LED_PIN, HIGH);
+
+    return true;
+}
+
+bool destroyEntities()
+{
+    syslog(LOG_INFO, "%s %lu", __FUNCTION__, millis());
+    rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+    (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+    rcl_publisher_fini(&odom_publisher, &node);
+    rcl_publisher_fini(&imu_publisher, &node);
+    rcl_publisher_fini(&mag_publisher, &node);
+    rcl_publisher_fini(&battery_publisher, &node);
+    rcl_publisher_fini(&range_publisher, &node);
+    rcl_subscription_fini(&twist_subscriber, &node);
+    rcl_timer_fini(&control_timer);
+    rcl_timer_fini(&battery_timer);
+    rcl_timer_fini(&range_timer);
+    rclc_executor_fini(&executor);
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+
+    digitalWrite(LED_PIN, HIGH);
+    
+    return true;
+}
+
+void fullStop()
+{
+    twist_msg.linear.x = 0.0;
     twist_msg.linear.y = 0.0;
     twist_msg.angular.z = 0.0;
-    unsigned long start_time = micros();
-    unsigned long last_status = micros();
-    for (int i = 0; i < total_motors; i++)
-    {
-        while (true)
-        {
-            if (micros() - start_time >= SAMPLE_TIME * 1000000)
-                {
-                    Serial.println("STOP motor");
-                    motors[i]->brake();
-                    Serial.println("=============");
-                    start_time = micros();
 
-                    break;
-                }
-
-            // do all speed calculations
-            // get the required rpm for each motor based on required velocities, and base used
-            Kinematics::rpm req_rpm = kinematics.getRPM(
-                twist_msg.linear.x,
-                twist_msg.linear.y,
-                twist_msg.angular.z);
-            float req_rpm_val = 0;
-            switch (i)
-            {
-            case 0:
-                req_rpm_val = req_rpm.motor1;
-                break;
-            case 1:
-                req_rpm_val = req_rpm.motor2;
-                break;
-            case 2:
-                req_rpm_val = req_rpm.motor3;
-                break;
-            case 3:
-                req_rpm_val = req_rpm.motor4;
-                break;
-            default:
-                break;
-            }
-            float current_rpm = encoders[i]->getRPM();
-
-            // the required rpm is capped at -/+ MAX_RPM to prevent the PID from having too much error
-            // the PWM value sent to the motor driver is the calculated PID based on required RPM vs measured RPM
-            Serial.print("req_rpm:: ");
-            Serial.print(req_rpm_val);
-            Serial.print(" current_rpm:: ");
-            Serial.print(current_rpm);
-            int pwm = pids[i]->compute(req_rpm_val, current_rpm);
-            Serial.print(" pwm:: ");
-            Serial.println(pwm);
-            motors[i]->spin(pwm);
-            delay(100);
-
-        }
-    }
+    motor1_controller.brake();
+    motor2_controller.brake();
+    motor3_controller.brake();
+    motor4_controller.brake();
 }
-void sampleMotors(bool show_summary)
+
+void moveBase()
 {
-    if (Kinematics::LINO_BASE == Kinematics::DIFFERENTIAL_DRIVE)
+    const float DEADZONE_VEL = 0.01;  // m/s หรือ rad/s สำหรับ twist
+    const float DEADZONE_RPM = 1.0;   // rpm สำหรับ PID
+
+    // Deadband twist
+    float cmd_linear_x = (fabs(twist_msg.linear.x) < DEADZONE_VEL) ? 0.0 : twist_msg.linear.x;
+    float cmd_linear_y = (fabs(twist_msg.linear.y) < DEADZONE_VEL) ? 0.0 : twist_msg.linear.y;
+    float cmd_angular = (fabs(twist_msg.angular.z) < DEADZONE_VEL) ? 0.0 : twist_msg.angular.z;
+
+    // brake if there's no command received, or first command
+    if(((millis() - prev_cmd_time) >= 200) ||
+       (cmd_linear_x == 0.0 && cmd_linear_y == 0.0 && cmd_angular == 0.0))
     {
-        total_motors = 2;
+        fullStop();
+        digitalWrite(LED_PIN, HIGH);
+        return;
     }
 
-    float measured_voltage = constrain(MOTOR_POWER_MEASURED_VOLTAGE, 0, MOTOR_OPERATING_VOLTAGE);
-    float scaled_max_rpm = ((measured_voltage / MOTOR_OPERATING_VOLTAGE) * MOTOR_MAX_RPM);
-    float total_rev = scaled_max_rpm * (SAMPLE_TIME / 60.0);
+    // get the required rpm for each motor
+    Kinematics::rpm req_rpm = kinematics.getRPM(cmd_linear_x, cmd_linear_y, cmd_angular);
+
+    // get current rpm
+    float current_rpm1 = motor1_encoder.getRPM();
+    float current_rpm2 = motor2_encoder.getRPM();
+    float current_rpm3 = motor3_encoder.getRPM();
+    float current_rpm4 = motor4_encoder.getRPM();
+
+    // apply deadband to RPM
+    if(fabs(req_rpm.motor1) < DEADZONE_RPM) req_rpm.motor1 = 0;
+    if(fabs(req_rpm.motor2) < DEADZONE_RPM) req_rpm.motor2 = 0;
+    if(fabs(req_rpm.motor3) < DEADZONE_RPM) req_rpm.motor3 = 0;
+    if(fabs(req_rpm.motor4) < DEADZONE_RPM) req_rpm.motor4 = 0;
+
+    // control motors using PID
+    motor1_controller.spin(motor1_pid.compute(req_rpm.motor1, current_rpm1));
+    motor2_controller.spin(motor2_pid.compute(req_rpm.motor2, current_rpm2));
+    motor3_controller.spin(motor3_pid.compute(req_rpm.motor3, current_rpm3));
+    motor4_controller.spin(motor4_pid.compute(req_rpm.motor4, current_rpm4));
+
+    // update odometry
+    Kinematics::velocities current_vel = kinematics.getVelocities(
+        current_rpm1, current_rpm2, current_rpm3, current_rpm4
+    );
+
+    unsigned long now = millis();
+    float vel_dt = (now - prev_odom_update) / 1000.0;
+    prev_odom_update = now;
+
+    odometry.update(current_vel.linear_x, current_vel.linear_y, current_vel.angular_z, vel_dt);
+}
+
+void publishData()
+{
+    odom_msg = odometry.getData();
+    imu_msg = imu.getData();
+    mag_msg = mag.getData();
+#ifdef MAG_BIAS
+    const float mag_bias[3] = MAG_BIAS;
+    mag_msg.magnetic_field.x -= mag_bias[0];
+    mag_msg.magnetic_field.y -= mag_bias[1];
+    mag_msg.magnetic_field.z -= mag_bias[2];
+#endif
     
-    for (int i = 0; i < total_motors; i++)
-    {
-        Serial.print("SPINNING ");
-        Serial.print(labels[i]);
+    double roll, pitch, yaw;
+    roll = atan2(imu_msg.linear_acceleration.y, imu_msg.linear_acceleration.z);
+    pitch = atan2(-imu_msg.linear_acceleration.y,
+                (sqrt(imu_msg.linear_acceleration.y * imu_msg.linear_acceleration.y +
+                      imu_msg.linear_acceleration.z * imu_msg.linear_acceleration.z)));
+    yaw = atan2(mag_msg.magnetic_field.y, mag_msg.magnetic_field.x);
+    // Convert to quaternion
+    double cy = cos(yaw * 0.5);
+    double sy = sin(yaw * 0.5);
+    double cp = cos(pitch * 0.5);
+    double sp = sin(pitch * 0.5);
+    double cr = cos(roll * 0.5);
+    double sr = sin(roll * 0.5);
+    imu_msg.orientation.x = cy * cp * sr - sy * sp * cr;
+    imu_msg.orientation.y = sy * cp * sr + cy * sp * cr;
+    imu_msg.orientation.z = sy * cp * cr - cy * sp * sr;
+    imu_msg.orientation.w = cy * cp * cr + sy * sp * sr;
 
-        unsigned long start_time = micros();
-        unsigned long last_status = micros();
+    struct timespec time_stamp = getTime();
 
-        encoders[i]->write(0);
-        while (true)
-        {
-            if (micros() - start_time >= SAMPLE_TIME * 1000000)
-            {
-                // Serial.println("STOP");
+    odom_msg.header.stamp.sec = time_stamp.tv_sec;
+    odom_msg.header.stamp.nanosec = time_stamp.tv_nsec;
 
-                motors[i]->spin(0);
-                Serial.println("");
-                break;
-            }
+    imu_msg.header.stamp.sec = time_stamp.tv_sec;
+    imu_msg.header.stamp.nanosec = time_stamp.tv_nsec;
 
-            if (micros() - last_status >= 1000000)
-            {
-                last_status = micros();
-                Serial.print(".");
-            }
-            delay(1); // Fix: without this small delay the motors don't spin
-            motors[i]->spin(PWM_MAX);
-        }
-        // Serial.println("before encoder read");
-        counts_per_rev[i] = encoders[i]->read() / total_rev;
-    }
-    if (show_summary)
-        printSummary();
+    mag_msg.header.stamp.sec = time_stamp.tv_sec;
+    mag_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+
+    RCSOFTCHECK(rcl_publish(&imu_publisher, &imu_msg, NULL));
+    RCSOFTCHECK(rcl_publish(&mag_publisher, &mag_msg, NULL));
+    RCSOFTCHECK(rcl_publish(&odom_publisher, &odom_msg, NULL));
 }
 
-void printSummary()
+bool syncTime()
 {
-    Serial.println("\r\n================MOTOR ENCODER READINGS================");
-    Serial.print(labels[0]);
-    Serial.print(encoders[0]->read());
-    Serial.print(" ");
+    const int timeout_ms = 1000;
+    if (rmw_uros_epoch_synchronized()) return true; // synchronized previously
+    // get the current time from the agent
+    RCCHECK(rmw_uros_sync_session(timeout_ms));
+    if (rmw_uros_epoch_synchronized()) {
+#if (_POSIX_TIMERS > 0)
+        // Get time in milliseconds or nanoseconds
+        int64_t time_ns = rmw_uros_epoch_nanos();
+	timespec tp;
+	tp.tv_sec = time_ns / 1000000000;
+	tp.tv_nsec = time_ns % 1000000000;
+	clock_settime(CLOCK_REALTIME, &tp);
+#else
+	unsigned long long ros_time_ms = rmw_uros_epoch_millis();
+	// now we can find the difference between ROS time and uC time
+	time_offset = ros_time_ms - millis();
+#endif
+	return true;
+    }
+    return false;
+}
 
-    Serial.print(labels[1]);
-    Serial.println(encoders[1]->read());
+struct timespec getTime()
+{
+    struct timespec tp = {0};
+#if (_POSIX_TIMERS > 0)
+    clock_gettime(CLOCK_REALTIME, &tp);
+#else
+    // add time difference between uC time and ROS time to
+    // synchronize time with ROS
+    unsigned long long now = millis() + time_offset;
+    tp.tv_sec = now / 1000;
+    tp.tv_nsec = (now % 1000) * 1000000;
+#endif
+    return tp;
+}
 
-    Serial.print(labels[2]);
-    Serial.print(encoders[2]->read());
-    Serial.print(" ");
+void rclErrorLoop() 
+{
+    while(true)
+    {
+        flashLED(2);
+	
+    }
+}
 
-    Serial.print(labels[3]);
-    Serial.println(encoders[3]->read());
-    Serial.println("");
-
-    Serial.println("================COUNTS PER REVOLUTION=================");
-    Serial.print(labels[0]);
-    Serial.print(counts_per_rev[0]);
-    Serial.print(" ");
-
-    Serial.print(labels[1]);
-    Serial.println(counts_per_rev[1]);
-
-    Serial.print(labels[2]);
-    Serial.print(counts_per_rev[2]);
-    Serial.print(" ");
-
-    Serial.print(labels[3]);
-    Serial.println(counts_per_rev[3]);
-    Serial.println("");
-
-    Serial.println("====================MAX VELOCITIES====================");
-    float max_rpm = kinematics.getMaxRPM();
-
-    Kinematics::velocities max_linear = kinematics.getVelocities(max_rpm, max_rpm, max_rpm, max_rpm);
-    Kinematics::velocities max_angular = kinematics.getVelocities(-max_rpm, max_rpm, -max_rpm, max_rpm);
-
-    Serial.print("Linear Velocity: +- ");
-    Serial.print(max_linear.linear_x);
-    Serial.println(" m/s");
-
-    Serial.print("Angular Velocity: +- ");
-    Serial.print(max_angular.angular_z);
-    Serial.println(" rad/s");
+void flashLED(int n_times)
+{
+    for(int i=0; i<n_times; i++)
+    {
+        digitalWrite(LED_PIN, HIGH);
+        delay(150);
+        digitalWrite(LED_PIN, LOW);
+        delay(150);
+    }
+    delay(1000);
 }
