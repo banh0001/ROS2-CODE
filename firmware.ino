@@ -34,7 +34,7 @@
 #define BAUDRATE 115200
 #endif
 #ifndef NODE_NAME
-#define NODE_NAME "linorobot_base_node"
+#define NODE_NAME "meca_base_node"
 #endif
 #ifndef TOPIC_PREFIX
 #define TOPIC_PREFIX
